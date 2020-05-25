@@ -2,6 +2,8 @@ import time as t
 import dask
 import numpy
 import gc
+import os
+import functools
 import xarray as xr
 import dask.bag as db
 from astropy import units as u
@@ -11,11 +13,23 @@ from dask.distributed import Client, wait
 from xarray import Dataset
 from casacore.tables import table
 from os import cpu_count
-from dask_arl.tool_function import arl_path
 
-LOAD_TIME = 0
-AVG_CHANNEL = 0
-AVG_TIME = 0
+
+def timer(func):
+    """Calculate the execution time of a function
+    :param func:
+    :return:
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kw):
+        start = t.time()
+        res = func(*args, **kw)
+        end = t.time()
+        print('Method:%s(...) costs %.2fs\n' % (func.__name__, end - start))
+        return res
+
+    return wrapper
 
 
 def configuration_init(ms_file) -> Dataset:
@@ -92,13 +106,7 @@ def msdataset_init(query_ms, fre_band, phasecentre, configuration, corr_type, ms
     qmax = numpy.max(antenna2)
     baseline_index = (2 * qmax - antenna1 + 1) * antenna1 // 2 + antenna2 - antenna1 - 1  # Note: int type
 
-    # print(baseline_index[35],antenna1[35],antenna2[35])
-    # print(baseline_index[34], antenna1[34], antenna2[34])
-
     miss = ntime * nbaseline - nrow
-    if miss > 0:
-        # print('Source:%s %d(total:%d)rows of data are missing\n' % (ms_tag, miss, nrow))
-        print(end='')
 
     vis = query_ms.getcol('DATA')
     weight = query_ms.getcol('WEIGHT')
@@ -111,20 +119,32 @@ def msdataset_init(query_ms, fre_band, phasecentre, configuration, corr_type, ms
     assert corr_type.shape[1] == npol
     assert weight.shape[1] == npol
 
-    b_vis = numpy.zeros([ntime, nbaseline, nchan, npol], dtype='complex64')
-    b_weight = numpy.zeros([ntime, nbaseline, npol])  # To save memory weight does not match the vis dimension
-    b_uvw = numpy.zeros([ntime, nbaseline, 3])
+    if miss > 0:
+        b_vis = numpy.zeros([ntime, nbaseline, nchan, npol], dtype='complex64')
+        b_weight = numpy.zeros([ntime, nbaseline, npol])  # To save memory weight does not broadcast to the vis
+        b_uvw = numpy.zeros([ntime, nbaseline, 3])
 
-    rstart = 0
-    for nt_index in range(ntime):
-        rend = rstart + ucount[nt_index]
+        rstart = 0
+        for nt_index in range(ntime):
+            rend = rstart + ucount[nt_index]
 
-        nb_index = baseline_index[rstart:rend]
-        b_vis[nt_index, nb_index, ...] = vis[rstart:rend, ...]
-        b_weight[nt_index, nb_index, :] = weight[rstart:rend, :]
-        b_uvw[nt_index, nb_index, :] = uvw[rstart:rend, :]
+            nb_index = baseline_index[rstart:rend]
+            b_vis[nt_index, nb_index, ...] = vis[rstart:rend, ...]
+            b_weight[nt_index, nb_index, :] = weight[rstart:rend, :]
+            b_uvw[nt_index, nb_index, :] = uvw[rstart:rend, :]
 
-        rstart += ucount[nt_index]
+            rstart += ucount[nt_index]
+
+    elif miss == 0:
+        b_vis = vis.reshape((ntime, nbaseline, nchan, npol))
+        b_weight = weight.reshape((ntime, nbaseline, npol))
+        b_uvw = uvw.reshape((ntime, nbaseline, 3))
+
+    else:
+        b_uvw = None
+        b_weight = None
+        b_vis = None
+        print('create an Empty MSData')
 
     del time, antenna1, antenna2, vis, weight, uvw
     gc.collect()
@@ -145,40 +165,11 @@ def msdataset_init(query_ms, fre_band, phasecentre, configuration, corr_type, ms
     msvis.attrs['tag'] = ms_tag
     msvis.attrs['phasecentre'] = phasecentre
     msvis.attrs['polarisation'] = corr_type
-
-    t.sleep(LOAD_TIME)
-    # print("Found %d channels, DATA column's shape=(%d, %d, %d)" % (nchan, nrow, nchan, npol))
-    """
-    <xarray.Dataset>
-    Dimensions:            (nant: 19, nbaseline: 171, nchan: 64, nfpos: 3, npol: 4, nspos: 3, ntime: 609)
-    Coordinates:
-      * ntime              (ntime) int64 0 1 2 3 4 5 6 ... 603 604 605 606 607 608
-      * nbaseline          (nbaseline) <U5 '0-1' '0-2' '0-3' ... '16-18' '17-18'
-      * nchan              (nchan) int64 0 1 2 3 4 5 6 7 ... 56 57 58 59 60 61 62 63
-      * npol               (npol) <U2 'p0' 'p1' 'p2' 'p3'
-      * nfpos              (nfpos) <U1 'u' 'v' 'w'
-      * nant               (nant) int64 0 1 2 3 4 5 6 7 ... 11 12 13 14 15 16 17 18
-      * nspos              (nspos) <U1 'x' 'y' 'z'
-    Data variables:
-        vis                (ntime, nbaseline, nchan, npol) complex64 (-0.00047232056+0.00036614382j) ... (0.006693074-0.001927636j)
-        weight             (ntime, nbaseline, npol) float64 9.0 9.0 9.0 ... 3.0 3.0
-        uvw                (ntime, nbaseline, nfpos) float64 -492.1 -312.9 ... 3.556
-        time               (ntime) float64 4.779e+09 4.779e+09 ... 4.779e+09
-        frequency          (nchan) float64 3.639e+10 3.639e+10 ... 3.64e+10
-        channel_bandwidth  (nchan) float64 1.25e+05 1.25e+05 ... 1.25e+05 1.25e+05
-        xyz                (nant, nspos) float64 -1.602e+06 -5.042e+06 ... 3.555e+06
-        mount              (nant) <U6 'ALT-AZ' 'ALT-AZ' ... 'ALT-AZ' 'ALT-AZ'
-        names              (nant) <U4 'ea01' 'ea02' 'ea03' ... 'ea25' 'ea27' 'ea28'
-        diameter           (nant) float64 25.0 25.0 25.0 25.0 ... 25.0 25.0 25.0
-    Attributes:
-        tag:           0_3
-        phasecentre:   [2.56544361 0.23174414]
-        polarisation:  [[5 6 7 8]\n [5 6 7 8]]
-    """
-
+    # print('Reading %d rows from the MeasurementSet (the remaining %d row(s) are missing)' % (nrow, miss))
     return msvis
 
 
+@timer
 def load_msdata(ms_file, ack=False):
     """
     :param ms_file: msfile name
@@ -188,9 +179,10 @@ def load_msdata(ms_file, ack=False):
 
     @delayed
     def pick_source(d, f, tab):
-        # p1 = t.time()
+
         fre_band = frequency_init(ms_file, d)
-        query_ms = tab.query(query='DATA_DESC_ID==%d AND FIELD_ID==%d' % (d, f), sortlist='TIME,ANTENNA1,ANTENNA2',
+        query_ms = tab.query(query='DATA_DESC_ID==%d AND FIELD_ID==%d AND ANTENNA1!=ANTENNA2' % (d, f),
+                             sortlist='TIME,ANTENNA1,ANTENNA2',
                              columns='UVW,WEIGHT,ANTENNA1,ANTENNA2,TIME,DATA')
         nrows = query_ms.nrows()
 
@@ -198,12 +190,9 @@ def load_msdata(ms_file, ack=False):
         ms_tag = str(d) + '_' + str(f)
         phasecentre = phasecentre_init(ms_file, f)
         ms_vis = msdataset_init(query_ms, fre_band, phasecentre, configuration, corr_type, ms_tag)
-        # p2 = t.time()
-        # print("Selecting %d rows from MS, using xarray to initialize Dataset:%.2f seconds\n" % (nrows, p2 - p1))
 
         return ms_vis
 
-    t1 = t.time()
     tmp = []
 
     configuration = configuration_init(ms_file)
@@ -214,7 +203,7 @@ def load_msdata(ms_file, ack=False):
         dds = numpy.unique(tab.getcol('DATA_DESC_ID'))  # ndarray <class 'tuple'>: (0,1) ===> relate to Frequency info
         fields = numpy.unique(tab.getcol('FIELD_ID'))  # ndarray <class 'tuple'>: (2,3,5,7)  ===> relate to Field info
 
-        print("Found spectral window:%s, and fields:%s\n" % (str(dds), str(fields)))
+        # print("Found spectral window:%s, and fields:%s\n" % (str(dds), str(fields)))
 
         for dd in dds:
             for field in fields:
@@ -223,14 +212,14 @@ def load_msdata(ms_file, ack=False):
 
         msvis_list = dask.compute(*tmp, scheduler='threads')
 
-    t2 = t.time()
     memory = [i.nbytes for i in msvis_list]
     total = numpy.sum(memory) / 1024 ** 2
-    print('Loading a single MS(Xarray total:%.2f MB) costs: %.2f seconds\n' % (total, t2 - t1))
+    print('Loading a single MS(Xarray total volumn:%.2f MB)' % total)
 
     return msvis_list
 
 
+@timer
 def time_average(seq_vis, avg_time=2):
     """
     Integrate visibility by timesteps
@@ -261,8 +250,9 @@ def time_average(seq_vis, avg_time=2):
         group_vis = (group_sum / group_weight + 1e-16).astype('complex64')  # .fillna(0.0 + 0.0j)
         group_time = vis_set.time.groupby_bins('ntime', bins=count, labels=label).mean(dim='ntime')
 
-        # TODO Fixed matrix uvw: a complicated operation to correct uvw
-        group_uvw = vis_set.uvw.groupby_bins('ntime', bins=count, labels=label).mean(dim='ntime')  # Temporarily substitute
+        # TODO a complicated operation to correct uvw
+        group_uvw = vis_set.uvw.groupby_bins('ntime', bins=count, labels=label).mean(
+            dim='ntime')
         # print(group_weight[0, 0].values)
 
         vis_set = vis_set.drop_dims('ntime')
@@ -270,10 +260,8 @@ def time_average(seq_vis, avg_time=2):
                                  vis=group_vis,
                                  uvw=group_uvw,
                                  time=group_time).rename({'ntime_bins': 'ntime'})
-        t.sleep(AVG_TIME)
         return vis_set
 
-    t1 = t.time()
     assert isinstance(avg_time, int)
     if avg_time == 1:  # no change
         return seq_vis
@@ -284,15 +272,15 @@ def time_average(seq_vis, avg_time=2):
         vis_list.append(single)
 
     time_avg = dask.compute(*vis_list, scheduler='threads')
-    t2 = t.time()
 
     memory = [i.nbytes for i in time_avg]
     total = numpy.sum(memory) / 1024 ** 2
-    print('Time(%d) averaging on MS (Xarray volume reduction to:%.2f MB) costs: %.2f seconds\n' % (avg_time, total, t2 - t1))
+    print('Time(%d) averaging on MS (Xarray volume reduced to:%.2f MB)' % (avg_time, total))
 
     return time_avg
 
 
+@timer
 def channel_average(seq_vis, avg_channel=4):
     """
     Integrate visibility by channels
@@ -333,10 +321,8 @@ def channel_average(seq_vis, avg_channel=4):
                                  vis=group_vis,
                                  frequency=fre,
                                  channel_bandwidth=bandwidth).rename({'nchan_bins': 'nchan'})
-        t.sleep(AVG_CHANNEL)
         return vis_set
 
-    t1 = t.time()
     assert isinstance(avg_channel, int)
     if avg_channel == 1:  # no change
         return seq_vis
@@ -347,37 +333,35 @@ def channel_average(seq_vis, avg_channel=4):
         vis_list.append(single)
 
     channel_avg = dask.compute(*vis_list, scheduler='threads')
-    t2 = t.time()
 
     memory = [i.nbytes for i in channel_avg]
     total = numpy.sum(memory) / 1024 ** 2
-    print('Channel(%d) averaging on MS (Xarray volume reduction to:%.2f MB) costs: %.2f seconds\n' % (avg_channel, total, t2 - t1))
+    print('Channel(%d) averaging on MS (Xarray volume reduced to:%.2f MB)' % (avg_channel, total))
     del seq_vis
     gc.collect()
     return channel_avg
 
 
 def combine_msdata(vis1: Dataset, vis2: Dataset):
-    p1 = t.time()
     assert vis1.tag == vis2.tag
     merge = xr.concat([vis1, vis2],
                       dim='ntime',
                       data_vars=['weight', 'uvw', 'vis'])
-    p2 = t.time()
-    print("Combining msdata costs:%.2f\n" % (p2 - p1))
 
     return merge
 
 
 if __name__ == '__main__':
+    # path_fmt = '/mnt/storage-ssd/luokaida/data/rawdata/3C129_pband_target.ms'
+    # load_data = load_msdata(path_fmt)
 
-    c = Client('172.31.99.84:8786')
-    # dask.config.set(scheduler='threads')
+    c = Client('172.31.99.84:8786').restart()
     start1 = t.time()
 
     print('cpu_count: %d' % cpu_count())
-    path_fmt = arl_path("source_data/orignal_vis/day2_TDEM0003_10s_norx.%d")
-    all_path = [path_fmt % i for i in range(1)]
+
+    path_fmt = '/mnt/storage-ssd/luokaida/data/rawdata/3C129_pband_target.ms'
+    all_path = [path_fmt for i in range(1)]
     print('the number of ms_files: %d\n' % len(all_path))
 
     files = db.from_sequence(all_path)
@@ -394,6 +378,6 @@ if __name__ == '__main__':
     # res = avg_ms.compute()  # Don't use .compute()
 
     end1 = t.time()
-    combine_ms.visualize(filename='flow_chart_20.pdf')
+    # combine_ms.visualize(filename='flow_chart_20.pdf')
     print('\nUsing dask-xarray:map-reduce costs %.2f seconds\n' % (end1 - start1))
     print()  # put a breakpoint here
