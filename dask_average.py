@@ -161,6 +161,7 @@ def msdataset_init(query_ms, fre_band, phasecentre, configuration, corr_type, ms
                                     'nfpos': ['u', 'v', 'w']})
 
     msvis = xr.merge([main_table, fre_band, configuration])
+    # msvis = xr.merge([main_table, fre_band, configuration]).chunk({'ntime':avg_time, 'nchan':avg_channel})  # avg_time & avg_channel:Shape of desired chunks (int)
 
     msvis.attrs['tag'] = ms_tag
     msvis.attrs['phasecentre'] = phasecentre
